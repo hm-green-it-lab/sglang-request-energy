@@ -283,3 +283,7 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# Energy attribution: run output and third-party papers stay local
+energy_attribution/runs/
+energy_attribution/papers/

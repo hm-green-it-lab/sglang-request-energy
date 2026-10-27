@@ -275,6 +275,7 @@ from sglang.srt.managers.scheduler_components.recv_skipper import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.managers.scheduler_components.step_tracer import create_step_tracer
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -711,6 +712,8 @@ class Scheduler(
         self.init_output_streamer()
 
         self.init_batch_result_processor()
+
+        self.init_step_tracer()
 
         self.init_rank_consensus_checker()
 
@@ -1925,11 +1928,14 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                self.step_tracer.on_launch_begin(batch)
                 result = self.run_batch(batch)
+                self.step_tracer.on_launch_end(batch)
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
+                self.step_tracer.on_idle()
                 self.on_idle()
 
             # Update last_batch
@@ -2510,6 +2516,15 @@ class Scheduler(
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
             abort_request=self.abort_request,
+        )
+
+    def init_step_tracer(self) -> None:
+        """Per-step JSONL trace for energy attribution; a no-op unless enabled."""
+        self.step_tracer = create_step_tracer(
+            gpu_id=get_device().gpu_id,
+            device=self.device,
+            enable_overlap=self.enable_overlap,
+            forward_stream=self.forward_stream,
         )
 
     def init_req_max_new_tokens(self, req):
@@ -4807,6 +4822,7 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+        self.step_tracer.on_result(batch)
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult
