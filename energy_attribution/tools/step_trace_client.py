@@ -157,7 +157,8 @@ def cmd_check(args: argparse.Namespace) -> None:
 
     Step checks, on the trace alone:
     - every step has a positive duration;
-    - without overlap, steps do not overlap in time, and each GPU window
+    - steps do not overlap in time (forwards share one stream in both modes);
+    - without overlap, each GPU window
       [t_start_ns, t_end_ns] lies inside its host window [host_launch_begin_ns,
       host_result_ns], within the anchor uncertainty plus --clock-tolerance-ns;
     - the number of owner rows equals batch_size (for traced steps);
@@ -168,7 +169,9 @@ def cmd_check(args: argparse.Namespace) -> None:
     - prefill tokens computed + prefix reused = prompt_tokens;
     - prefix reused = the server's cached_tokens;
     - decode rows = completion_tokens - 1 (the prefill step samples the first
-      token, each decode step one more);
+      token, each decode step one more), plus 1 under overlap: a finished request
+      rides along for one discarded step, since step N+1 is launched before step
+      N's result shows the request finished;
     - the last prefill chunk is not marked is_chunked.
     Retracted requests are skipped, since their prefill was partly recomputed.
 
@@ -198,8 +201,9 @@ def cmd_check(args: argparse.Namespace) -> None:
     for o in owners:
         owners_by_step[o["step_id"]].append(o)
     overlap = any(s["overlap_enabled"] for s in steps)
+    # Forwards run one after another on one stream, with or without overlap.
     for prev, cur in zip(steps, steps[1:]):
-        if not overlap and cur["t_start_ns"] < prev["t_end_ns"]:
+        if cur["t_start_ns"] < prev["t_end_ns"]:
             fail(f"steps {prev['step_id']} and {cur['step_id']} overlap in time")
     anchors = {a["anchor_id"]: a for a in trace["anchor"]}
     max_skew_ns = 0
@@ -249,10 +253,13 @@ def cmd_check(args: argparse.Namespace) -> None:
         if reused != req["cached_tokens"]:
             fail(f"{rid}: reused {reused} != server cached_tokens {req['cached_tokens']}")
         # The prefill step samples the first token; each decode step one more.
-        if len(decode) != req["completion_tokens"] - 1:
+        # Under overlap a finished request rides along for one discarded step,
+        # because step N+1 is launched before step N's result shows it finished.
+        expected_decode = req["completion_tokens"] - 1 + (1 if overlap else 0)
+        if len(decode) != expected_decode:
             fail(
-                f"{rid}: {len(decode)} decode steps "
-                f"!= completion_tokens - 1 = {req['completion_tokens'] - 1}"
+                f"{rid}: {len(decode)} decode steps != expected {expected_decode} "
+                f"(completion_tokens {req['completion_tokens']}, overlap={overlap})"
             )
         if any(r["is_chunked"] for r in prefill[-1:]):
             fail(f"{rid}: last prefill chunk marked is_chunked")

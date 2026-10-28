@@ -13,8 +13,7 @@ approach (phases 1-4).
 
 | Configuration | Status |
 |---|---|
-| `--disable-overlap-schedule`, prefill / decode / chunked prefill / mixed chunk | Supported; validated on RTX 4090 |
-| Overlap scheduler (SGLang default) | Not wired up yet |
+| Prefill / decode / chunked prefill / mixed chunk, with or without `--disable-overlap-schedule` | Supported; validated on RTX 4090 |
 | Retraction | Recorded (`retraction_count`), not yet exercised in tests |
 | Speculative decoding, DP attention, PP, PD disaggregation | Out of scope: steps are written with `owners_traced: false` and no owner rows |
 
@@ -179,15 +178,14 @@ One entry per request, as reported by the server.
 - Per request (skipped if it was retracted):
   - prefill tokens computed + prefix reused = `prompt_tokens`;
   - prefix reused = server's `cached_tokens`;
-  - number of decode rows = `completion_tokens - 1` (the prefill step produces the first token);
+  - number of decode rows = `completion_tokens - 1` (the prefill step produces the first token), plus 1 under overlap (a finished request rides along for one discarded step);
   - the last prefill chunk is not marked `is_chunked`.
 - Per step:
   - positive duration;
   - number of owner rows = `batch_size`;
   - owner tokens sum to the step totals.
-- Without overlap:
-  - steps do not overlap in time;
-  - each GPU window lies inside its host window (launch begin to result), within the anchor uncertainty plus `--clock-tolerance-ns`.
+- Steps do not overlap in time (forwards run one after another on one stream, in both modes).
+- Without overlap only: each GPU window lies inside its host window (launch begin to result), within the anchor uncertainty plus `--clock-tolerance-ns`.
 
 It also prints coverage (mixed steps, chunked rows, prefix-reuse rows), so you
 can see which code paths a run actually exercised.

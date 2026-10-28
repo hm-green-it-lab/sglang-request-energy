@@ -130,5 +130,23 @@ decides who pays for shared prefixes.
     (`selected_tokens` and context/KV-read summed over the rows). Not tested; beam search was
     not used so far.
 
+## Overlap scheduler (done 2026-10-28)
+Hooks are wired into `event_loop_overlap` too; both modes validated on the RTX 4090
+(runs `2026-10-28_no-overlap`, `2026-10-28_overlap`, 160 requests each).
+- Start event: under overlap the tracer makes `forward_stream` wait on the schedule stream
+  before recording, so it marks when the step's inputs are ready.
+- `on_delayed_sample`: re-records the end event behind sampling the overlap loop defers
+  (grammar batches, `SGLANG_ENABLE_DELAY_SAMPLE`).
+- Anchoring: under overlap only when idle (sync would stall the pipeline). TODO: offline drift
+  correction by interpolating between consecutive anchors (phase 3).
+- Confirmed: under overlap every request has exactly one extra trailing decode row (context
+  `prompt + completion`), the discarded step a finished request rides along for. Attribution
+  decision for phase 3: charge it to the request (it caused the work).
+- Measured: gaps between steps median 0.29 ms without overlap vs 0.002 ms with; GPU-window
+  share of wall time 89% vs 94%; decode step median 5.27 vs 4.96 ms.
+- Residuals: small `run_batch` ops before its own wait may make the start event fire
+  microseconds early; under overlap the result copy runs on a separate stream outside the
+  window.
+
 ## Next step
-Implement phase 1.
+Phase 2: NVML sampler.

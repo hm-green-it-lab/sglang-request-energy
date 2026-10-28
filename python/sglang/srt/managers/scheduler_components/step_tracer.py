@@ -16,18 +16,23 @@ Three hooks per step, all host-only except the event records:
 
 - ``on_launch_begin`` (after batch selection): snapshot owners and record the start CUDA event on the stream the forward runs on.
 - ``on_launch_end`` (after ``run_batch`` returns): record the end CUDA event.
+- ``on_delayed_sample`` (overlap only, after ``launch_batch_sample_if_needed``):
+  re-record the end event behind sampling that the overlap loop launched late.
 - ``on_result`` (in ``process_batch_result``): the forward has completed, so read both events, convert them to host ns via the clock anchor, and buffer the records.
 
 GPU event times are mapped to the host clock with an anchor: drain the device,
 record an event, and bracket its completion with the host clock; the
 bracket half-width is the anchor uncertainty. Anchors are re-taken only when
 that costs no overlap (non-overlap mode after a result, or when idle), and
-every anchor is written to the trace so drift can be corrected offline.
+every anchor is written to the trace so drift can be corrected offline by
+interpolating between consecutive anchors.
 
-Validated with ``--disable-overlap-schedule``. Under the overlap scheduler the
-start event sits on ``forward_stream`` before it waits on the schedule stream,
-so it marks when the previous forward drained rather than when this one began.
-Speculative decoding, DP attention, PP and PD disaggregation are out of scope;
+Works with and without the overlap scheduler. Under overlap the forward runs
+on ``forward_stream`` and step N's result is processed after step N+1 is
+launched; the start event is recorded only after ``forward_stream`` waits on the
+schedule stream, so it marks when the step's inputs are ready, not when the
+previous forward drained. The result copy runs on a separate stream there and
+is not part of the window. Speculative decoding, DP attention, PP and PD disaggregation are out of scope;
 steps in those modes are written without owner records.
 
 Enable with ``SGLANG_ENABLE_STEP_TRACE=1``; output lands in
@@ -147,6 +152,9 @@ class NoopStepTracer:
     def on_launch_end(self, batch: ScheduleBatch) -> None:
         pass
 
+    def on_delayed_sample(self, batch: Optional[ScheduleBatch]) -> None:
+        pass
+
     def on_result(self, batch: ScheduleBatch) -> None:
         pass
 
@@ -217,7 +225,7 @@ class SchedulerStepTracer:
             owners=owners,
             owners_traced=owners_traced,
             host_launch_begin_ns=trace_clock_ns(),
-            start_event=self._record_event(),
+            start_event=self._record_start_event(),
         )
 
     def on_launch_end(self, batch: ScheduleBatch) -> None:
@@ -233,6 +241,19 @@ class SchedulerStepTracer:
         step.end_event = self._record_event()
         step.host_launch_end_ns = trace_clock_ns()
         self._pending[batch.forward_iter] = step
+
+    def on_delayed_sample(self, batch: Optional[ScheduleBatch]) -> None:
+        """Move the step's end event behind sampling launched after run_batch.
+
+        The overlap loop may defer sampling (grammar-constrained batches,
+        SGLANG_ENABLE_DELAY_SAMPLE) until the previous result is processed. If
+        nothing was deferred, the new end event fires right after the old one.
+        """
+        if batch is None:
+            return
+        step = self._pending.get(batch.forward_iter)
+        if step is not None:
+            step.end_event = self._record_event()
 
     def on_result(self, batch: ScheduleBatch) -> None:
         """
@@ -325,6 +346,13 @@ class SchedulerStepTracer:
         self._buffer.extend(owners)
 
     # ===== Clock anchoring =====
+
+    def _record_start_event(self) -> Optional[torch.cuda.Event]:
+        if self._use_device_events and self._enable_overlap:
+            # Same wait run_batch issues; without it the event fires when the
+            # previous forward drains, before this step's inputs are ready.
+            self._forward_stream.wait_stream(torch.cuda.current_stream())
+        return self._record_event()
 
     def _record_event(self) -> Optional[torch.cuda.Event]:
         if not self._use_device_events:

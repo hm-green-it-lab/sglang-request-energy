@@ -8,7 +8,7 @@ Systems".
 
 | Phase | Status |
 |---|---|
-| 1. Step trace (scheduler steps + per-request demand) | Done without overlap scheduler; overlap pending |
+| 1. Step trace (scheduler steps + per-request demand) | Done, with and without the overlap scheduler |
 | 2. NVML power sampler | Not started |
 | 3. Offline attribution | Not started |
 | 4. Validation (overhead, isolated vs co-scheduled) | Not started |
@@ -38,8 +38,8 @@ Container Toolkit (`docker run --gpus all` works), and git.
 **1. Clone the fork.**
 
 ```bash
-git clone -b resource-tracking https://github.com/BZoennchen/sglang.git
-cd sglang
+git clone -b resource-tracking https://github.com/hm-green-it-lab/sglang-request-energy.git
+cd sglang-request-energy
 ```
 
 **2. Start a traced server.** This runs the official SGLang image, mounts the
@@ -62,11 +62,13 @@ docker run --rm -it --init --name sglang-trace \
     lmsysorg/sglang:v0.5.21 \
     bash -c "SGLANG_BUILD_RUST_EXTS=none pip install -q -e python --no-deps && \
              python -m sglang.launch_server --model-path $MODEL \
-                 --host 0.0.0.0 --port 30000 --disable-overlap-schedule"
+                 --host 0.0.0.0 --port 30000"
 ```
 
-- `--disable-overlap-schedule` is required for now: with the overlap scheduler
-  (SGLang's default) the trace contains only its header lines.
+- Works with the overlap scheduler (SGLang's default) and with
+  `--disable-overlap-schedule`. Under overlap, each request has one extra
+  decode step at the end: a finished request rides along for one discarded step,
+  because step N+1 is launched before step N's result shows it finished.
 - To exercise chunked and mixed steps, append
   `--chunked-prefill-size 1024 --enable-mixed-chunk`.
 - Supported: one GPU, or plain tensor parallelism (`--tp N`, one trace file per
@@ -98,7 +100,7 @@ python3 energy_attribution/tools/step_trace_client.py check \
 ```
 
 If the client runs on another machine, fetch the trace first, e.g.
-`rsync -av <server>:sglang/energy_attribution/runs/$RUN/ energy_attribution/runs/$RUN/`.
+`rsync -av <server>:sglang-request-energy/energy_attribution/runs/$RUN/ energy_attribution/runs/$RUN/`.
 The tracer writes buffered records when the server goes idle, so wait a few
 seconds after `send` finishes. With tensor parallelism, check each rank's file
 separately.
@@ -123,8 +125,7 @@ that produced it.
 - **Prompt sizes.** The client's prompts reach about 2,000-2,500 tokens plus
   `--max-new-tokens`; lower `--max-new-tokens` for models with a small context
   window.
-- **Check failures that are not tracer bugs:** overlap scheduler on (no steps),
-  speculative decoding (no owner rows), beam search (member rows dropped),
+- **Check failures that are not tracer bugs:** speculative decoding (no owner rows), beam search (member rows dropped),
   aborted requests (token counts differ). Retracted requests are skipped. On
   very different hardware, `--clock-tolerance-ns` (default 0.2 ms) may need
   loosening; the printed anchor uncertainty is its floor.

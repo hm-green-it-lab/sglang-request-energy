@@ -1991,7 +1991,9 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                self.step_tracer.on_launch_begin(batch)
                 batch_result = self.run_batch(batch)
+                self.step_tracer.on_launch_end(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
@@ -2005,12 +2007,14 @@ class Scheduler(
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
+                self.step_tracer.on_idle()
                 self.on_idle()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result, batch)
+                self.step_tracer.on_delayed_sample(batch)
 
             # Update last_batch
             self.last_batch = batch
