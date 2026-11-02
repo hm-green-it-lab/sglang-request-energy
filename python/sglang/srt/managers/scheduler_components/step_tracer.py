@@ -312,6 +312,7 @@ class SchedulerStepTracer:
     def _emit_step(self, *, step_id: int, step: _OpenStep) -> None:
         if self._use_device_events:
             # No-op once the result has been copied out; guards the overlap path.
+            # This should never block for long because the GPU should be ready here
             step.end_event.synchronize()
             t_start_ns = self._event_to_host_ns(step.start_event)
             t_end_ns = self._event_to_host_ns(step.end_event)

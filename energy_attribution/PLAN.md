@@ -68,11 +68,12 @@ Follow-ups, in priority order:
 1. **Prefix build role and prefix id (main trace gap).** Needed for Seam's default
    builder-pays prefix policy (prefix-build activity charged to the request that built it,
    warm hits charged nothing) and its amortized variant (build cost spread over all requests
-   sharing the prefix id). At prefill, SGLang knows the matched radix node (`req.last_node`,
-   a `TreeNode` with a stable `id`, mem_cache/radix_cache.py). Record that id per prefill
-   owner row as the prefix group. Builder role can be derived offline: the first request
-   whose computed tokens later appear as another request's cache hit. A fully online role
-   would need a hook where SGLang inserts nodes into the radix tree.
+   sharing the prefix). Design in `docs/prefix_attribution.md`: the tracer records chained
+   block hashes of the token content (reused prefix id, blocks built per request, plus
+   generated tokens at finish for multi-turn); builders are resolved offline. Radix node ids
+   were rejected (unstable under splits and eviction, need hooks in both tree cores). The
+   same data also detects recomputation and classifies its cause (eviction, concurrent
+   prefill, retraction).
 2. **Recompute tokens.** Derivable offline: after a retraction, a request's prefill tokens up
    to the context length it had already reached are recomputation. Optional explicit field
    `recompute_tokens` on owner rows. Retraction has not been exercised in tests yet.

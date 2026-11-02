@@ -20,9 +20,11 @@ Details and the optional improvements are in [PLAN.md](PLAN.md).
 | Path | Contents |
 |---|---|
 | [`PLAN.md`](PLAN.md) | Phases, design notes, optional improvements |
+| [`docs/prefix_attribution.md`](docs/prefix_attribution.md) | Design: who pays for shared prefixes (chained block hashes, recomputation detection) |
 | [`docs/step_trace.md`](docs/step_trace.md) | Trace format reference: env vars, record fields, clock, validation |
 | [`tools/step_trace_client.py`](tools/step_trace_client.py) | Sends a concurrent workload and checks a trace against it |
 | [`tools/plot_step_trace.py`](tools/plot_step_trace.py) | Plots a trace (and its manifest) for visual sanity checks; needs pandas + matplotlib |
+| [`tests/`](tests/) | Tracer tests: owner logic and hook bookkeeping (CPU), timing against reference events and host brackets (GPU); run with `python -m pytest energy_attribution/tests -v` where SGLang is importable |
 | `runs/<date>_<name>/` | One folder per experiment (git-ignored): `trace.jsonl`, `manifest.json`, `server_cmd.txt` |
 | `papers/` | Reference PDFs (git-ignored) |
 

@@ -175,7 +175,7 @@ One entry per request, as reported by the server.
 
 ### What `check` verifies
 
-- Per request (skipped if it was retracted):
+- Per request (skipped if it was retracted):_snapshot_owners_snapshot_owners
   - prefill tokens computed + prefix reused = `prompt_tokens`;
   - prefix reused = server's `cached_tokens`;
   - number of decode rows = `completion_tokens - 1` (the prefill step produces the first token), plus 1 under overlap (a finished request rides along for one discarded step);
