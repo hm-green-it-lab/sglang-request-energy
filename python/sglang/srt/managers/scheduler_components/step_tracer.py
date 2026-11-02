@@ -175,6 +175,12 @@ class SchedulerStepTracer:
         atexit.register(self.close)
 
     def _can_reanchor(self):
+        # The shared resolver checks this idle gate before its time threshold.
+        # Catch asynchronous disk failures even after the last step was queued.
+        if self.native:
+            health = self.native.health()
+            if health["error"] or health["dropped_records"]:
+                raise RuntimeError("Native trace writer failed; attribution is invalid")
         with self._lock:
             return self._idle and not self.prepared
 
