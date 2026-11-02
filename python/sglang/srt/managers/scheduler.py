@@ -1928,7 +1928,6 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                self.step_tracer.on_launch_begin(batch)
                 result = self.run_batch(batch)
                 self.step_tracer.on_launch_end(batch)
                 self.process_batch_result(batch, result)
@@ -1991,7 +1990,6 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                self.step_tracer.on_launch_begin(batch)
                 batch_result = self.run_batch(batch)
                 self.step_tracer.on_launch_end(batch)
                 # Fence result processing behind this forward's shared reads.
@@ -2529,6 +2527,14 @@ class Scheduler(
             device=self.device,
             enable_overlap=self.enable_overlap,
             forward_stream=self.forward_stream,
+            supported_profile=(
+                self.disaggregation_mode == DisaggregationMode.NULL
+                and not self.enable_dp_attention
+                and self.is_generation
+                and not self.enable_hierarchical_cache
+                and not self.enable_lmcache
+                and not self.enable_unified_cache_external_linker
+            ),
         )
 
     def init_req_max_new_tokens(self, req):
@@ -3283,6 +3289,7 @@ class Scheduler(
         self.output_streamer.stream_output([req], req.return_logprob)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        self.step_tracer.arrive(req, is_retracted=is_retracted)
         if not self._set_or_validate_priority(req):
             self._release_aborted_request(req)
             return
@@ -3347,6 +3354,7 @@ class Scheduler(
 
     def _release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
+        self.step_tracer.abort(req)
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
@@ -4363,6 +4371,7 @@ class Scheduler(
         self.metrics_reporter.record_scheduler_active()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        self.step_tracer.prepare(batch)
         batch.launch_ts = time.monotonic()
         is_split_prefill = batch.forward_mode.is_split_prefill()
         if not is_split_prefill or batch.split_index == 0:
@@ -4404,6 +4413,7 @@ class Scheduler(
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
+                    self.step_tracer.on_launch_begin(batch)
                     # resolve consumes SB staging (prefill_input_ids_cpu /
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring
@@ -4605,6 +4615,7 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
+                self.step_tracer.on_launch_begin(batch)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
@@ -4753,7 +4764,9 @@ class Scheduler(
 
         with self.forward_stream_ctx:
             self.forward_stream.wait_stream(self.schedule_stream)
+            self.step_tracer.on_sample_begin(cur_batch)
             _batch_result = batch_result.delay_sample_func()
+            self.step_tracer.on_sample_end(cur_batch)
             assert _batch_result is batch_result
             # Delay-sample is non-spec only; relays the sampled bonus tokens.
             self._relay_forward_payload(

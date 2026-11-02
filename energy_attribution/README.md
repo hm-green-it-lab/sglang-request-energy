@@ -6,6 +6,12 @@ SGLang scheduler batched together. The approach follows Roy 2026 ("Seam") and
 our draft paper "Runtime Energy Attribution of Inference Requests in LLM Serving
 Systems".
 
+The `codex/request-energy-runtime` feature branch integrates that work with the
+independent attribution SDK. The native checker and plots remain unchanged.
+Tracing now requires the matching SDK 0.2.0 wheel; ordinary serving without
+tracing does not. [Native/canonical configuration and contracts](CANONICAL_TRACE.md)
+describe both outputs and the central processor's separate responsibility.
+
 | Phase | Status |
 |---|---|
 | 1. Step trace (scheduler steps + per-request demand) | Done, with and without the overlap scheduler |
@@ -51,18 +57,21 @@ land in `energy_attribution/runs/$RUN` on the host.
 ```bash
 MODEL=Qwen/Qwen2.5-1.5B-Instruct
 RUN=$(date +%F)_my-run
+SDK_WHEEL=/absolute/path/to/llm_request_energy-0.2.0-py3-none-any.whl
 mkdir -p energy_attribution/runs/$RUN
 
 docker run --rm -it --init --name sglang-trace \
     --gpus all --shm-size 32g --ipc=host -p 30000:30000 \
     -v "$PWD":/workspace/sglang -w /workspace/sglang \
+    -v "$SDK_WHEEL":/tmp/llm_request_energy-0.2.0-py3-none-any.whl:ro \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     -e HF_TOKEN \
     -e SGLANG_ENABLE_STEP_TRACE=1 \
     -e SGLANG_STEP_TRACE_DIR=/workspace/sglang/energy_attribution/runs/$RUN \
     -e SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python \
     lmsysorg/sglang:v0.5.21 \
-    bash -c "SGLANG_BUILD_RUST_EXTS=none pip install -q -e python --no-deps && \
+    bash -c "pip install --no-deps /tmp/llm_request_energy-0.2.0-py3-none-any.whl && \
+             SGLANG_BUILD_RUST_EXTS=none pip install -q -e python --no-deps && \
              python -m sglang.launch_server --model-path $MODEL \
                  --host 0.0.0.0 --port 30000"
 ```

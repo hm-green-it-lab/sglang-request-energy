@@ -1,549 +1,477 @@
-"""Per-step scheduler trace for offline per-request energy attribution.
+"""Native SGLang and canonical traces from one frozen ownership/timing source.
 
-Each forward pass yields one ``step`` record (GPU-anchored start/end on the
-host ``CLOCK_MONOTONIC_RAW`` clock plus batch totals) and one ``owner`` record
-per request in the batch (its token demand in that step). Records go to a buffered JSONL
-sidecar per scheduler process, keyed by ``step_id`` and joined to requests by
-``rid``; an external power sampler (NVML / RAPL) on the same clock
-can then be windowed onto steps and split across owners offline.
-
-All ``*_ns`` fields are ``CLOCK_MONOTONIC_RAW``, not ``time.monotonic_ns()``:
-the slewed ``CLOCK_MONOTONIC`` ran 2-4% off the GPU event timer under WSL2
-(measured on an RTX 4090), while the raw clock tracked it to ~0.1%. A power
-sampler must timestamp with the same clock to be joinable.
-
-Three hooks per step, all host-only except the event records:
-
-- ``on_launch_begin`` (after batch selection): snapshot owners and record the start CUDA event on the stream the forward runs on.
-- ``on_launch_end`` (after ``run_batch`` returns): record the end CUDA event.
-- ``on_delayed_sample`` (overlap only, after ``launch_batch_sample_if_needed``):
-  re-record the end event behind sampling that the overlap loop launched late.
-- ``on_result`` (in ``process_batch_result``): the forward has completed, so read both events, convert them to host ns via the clock anchor, and buffer the records.
-
-GPU event times are mapped to the host clock with an anchor: drain the device,
-record an event, and bracket its completion with the host clock; the
-bracket half-width is the anchor uncertainty. Anchors are re-taken only when
-that costs no overlap (non-overlap mode after a result, or when idle), and
-every anchor is written to the trace so drift can be corrected offline by
-interpolating between consecutive anchors.
-
-Works with and without the overlap scheduler. Under overlap the forward runs
-on ``forward_stream`` and step N's result is processed after step N+1 is
-launched; the start event is recorded only after ``forward_stream`` waits on the
-schedule stream, so it marks when the step's inputs are ready, not when the
-previous forward drained. The result copy runs on a separate stream there and
-is not part of the window. Speculative decoding, DP attention, PP and PD disaggregation are out of scope;
-steps in those modes are written without owner records.
-
-Enable with ``SGLANG_ENABLE_STEP_TRACE=1``; output lands in
-``SGLANG_STEP_TRACE_DIR`` as ``step_trace.<rank tag>.<pid>.jsonl``.
+Preserves PR #1's meta/anchor/step/owner wire contract and its checker/plots.
+The optional shared SDK resolves one event pair per execution. Native envelopes
+are diagnostics; only canonical constituent intervals enter energy allocation.
 """
 
 from __future__ import annotations
 
 import atexit
-import logging
+import json
 import os
-import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
-
-import msgspec
-import torch
+import threading
+import uuid
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 
-if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
-
-logger = logging.getLogger(__name__)
-
-TRACE_SCHEMA_VERSION = 1
-TRACE_CLOCK = "CLOCK_MONOTONIC_RAW"
+NATIVE_FORMAT = "sglang.step-trace.native"
 
 
-def trace_clock_ns() -> int:
-    return time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
-
-
-class MetaRecord(msgspec.Struct, tag_field="kind", tag="meta", frozen=True):
-    schema_version: int
-    clock: str
-    pid: int
-    rank_tag: str
-    gpu_id: int
-    device_name: str
-    # Matches nvmlDeviceGetUUID ("GPU-..."), so a sampler can pick its device.
-    device_uuid: Optional[str]
-    enable_overlap: bool
-    time_source: str
-
-
-class AnchorRecord(msgspec.Struct, tag_field="kind", tag="anchor", frozen=True):
-    anchor_id: int
-    host_ns: int
-    # Half-width of the host bracket around the anchor event's completion.
-    uncertainty_ns: int
-
-
-class StepRecord(msgspec.Struct, tag_field="kind", tag="step", frozen=True):
-    step_id: int
-    forward_mode: str
-    batch_size: int
-    # GPU execution window (device events mapped through anchor_id).
-    t_start_ns: int
-    t_end_ns: int
-    # Host-side launch window around run_batch, for cross-checking.
-    host_launch_begin_ns: int
-    host_launch_end_ns: int
-    host_result_ns: int
-    anchor_id: int
-    num_prefill_reqs: int
-    num_decode_reqs: int
-    prefill_tokens: int
-    decode_tokens: int
-    # Prefix tokens reused (radix hits and earlier chunks) by prefill owners.
-    cached_tokens: int
-    # KV tokens attended over by all owners (sum of context_len - selected_tokens).
-    kv_read_tokens: int
-    overlap_enabled: bool
-    owners_traced: bool
-
-
-class OwnerRecord(msgspec.Struct, tag_field="kind", tag="owner", frozen=True):
-    step_id: int
+@dataclass(frozen=True)
+class OwnerSnapshot:
     rid: str
-    # "prefill" or "decode"; a mixed batch carries both.
     phase: str
-    # New tokens computed for this owner in the step.
     selected_tokens: int
-    # KV length after the step (prefix + selected).
     context_len: int
-    # Prefix tokens reused in this step instead of recomputed.
     cached_tokens: int
-    # Cumulative radix-cache hit tokens of the request.
     req_cached_tokens: int
-    # True for a non-final prefill chunk.
     is_chunked: bool
     retraction_count: int
+    recompute_tokens: int = 0
+
+    def native(self, step_id):
+        return {"kind": "owner", "step_id": step_id, **asdict(self)}
+
+    def canonical(self):
+        n = self.selected_tokens
+        return {
+            "request_id": self.rid,
+            "phase": self.phase,
+            "computed_tokens": n,
+            "prefill_tokens": n if self.phase == "prefill" else 0,
+            "decode_tokens": n if self.phase == "decode" else 0,
+            "context_tokens": self.context_len,
+            "recompute_tokens": self.recompute_tokens,
+            "cache_reused_tokens": self.cached_tokens,
+            "radix_cache_hits_total": self.req_cached_tokens,
+            "retraction_count": self.retraction_count,
+            "is_chunked": self.is_chunked,
+            "kv_read_token_pairs": n * (self.context_len - n) + n * (n + 1) // 2,
+            "flops_estimate": None,
+            "read_bytes_estimate": None,
+            "write_bytes_estimate": None,
+        }
 
 
-TraceRecord = Union[MetaRecord, AnchorRecord, StepRecord, OwnerRecord]
-
-
-class _OpenStep(msgspec.Struct):
+@dataclass(frozen=True)
+class StepSnapshot:
+    step_id: int
     forward_mode: str
     batch_size: int
-    owners: List[OwnerRecord]
+    owners: tuple[OwnerSnapshot, ...]
     owners_traced: bool
     host_launch_begin_ns: int
-    start_event: Optional[torch.cuda.Event]
-    host_launch_end_ns: int = 0
-    end_event: Optional[torch.cuda.Event] = None
 
 
 class NoopStepTracer:
-    """Disabled tracer; keeps the scheduler call sites branch-free."""
-
-    def on_launch_begin(self, batch: ScheduleBatch) -> None:
+    def prepare(self, batch):
         pass
 
-    def on_launch_end(self, batch: ScheduleBatch) -> None:
+    def on_launch_begin(self, batch):
         pass
 
-    def on_delayed_sample(self, batch: Optional[ScheduleBatch]) -> None:
+    def on_launch_end(self, batch):
         pass
 
-    def on_result(self, batch: ScheduleBatch) -> None:
+    def on_sample_begin(self, batch):
         pass
 
-    def on_idle(self) -> None:
+    def on_sample_end(self, batch):
         pass
 
-    def close(self) -> None:
+    def on_delayed_sample(self, batch):
+        pass
+
+    def on_result(self, batch):
+        pass
+
+    def on_idle(self):
+        pass
+
+    def arrive(self, req, is_retracted=False):
+        pass
+
+    def abort(self, req):
+        pass
+
+    def close(self):
         pass
 
 
 class SchedulerStepTracer:
-    def __init__(
-        self,
-        *,
-        output_dir: str,
-        rank_tag: str,
-        gpu_id: int,
-        device: str,
-        enable_overlap: bool,
-        forward_stream: Optional[torch.cuda.Stream],
-        flush_steps: int,
-        reanchor_interval_s: float,
-    ):
-        self._enable_overlap = enable_overlap
-        self._forward_stream = forward_stream
-        self._flush_steps = max(1, flush_steps)
-        self._reanchor_interval_ns = int(reanchor_interval_s * 1e9)
-        self._use_device_events = device == "cuda" and torch.cuda.is_available()
+    def __init__(self, *, gpu_id, enable_overlap, forward_stream, supported_profile):
+        from request_energy import clock
+        from request_energy.instrumentation import CudaStepTracer, LifecycleTracer
+        from request_energy.trace import TraceWriter
 
-        self._encoder = msgspec.json.Encoder()
-        self._buffer: List[TraceRecord] = []
-        self._steps_since_flush = 0
-        self._open: Optional[_OpenStep] = None
-        # Launched-but-unprocessed steps by forward_iter; >1 entry under overlap.
-        self._pending: Dict[int, _OpenStep] = {}
-
-        self._anchor_id = -1
-        self._anchor_event: Optional[torch.cuda.Event] = None
-        self._anchor_host_ns = 0
-
-        os.makedirs(output_dir, exist_ok=True)
-        self.path = os.path.join(
-            output_dir, f"step_trace.{rank_tag}.{os.getpid()}.jsonl"
+        self.clock = clock
+        self._lock = threading.RLock()
+        self._idle, self._closed = True, False
+        self.prepared, self.recompute_ranges = {}, {}
+        self.known = set()
+        self.native = self.lifecycle = None
+        self.enable_overlap = enable_overlap
+        self.stream = forward_stream if enable_overlap else None
+        self.supported_profile = supported_profile
+        canonical = bool(os.environ.get("REQUEST_ENERGY_TRACE_DIR"))
+        parallel = get_parallel()
+        self.device = CudaStepTracer(
+            "sglang",
+            f"tp{parallel.tp_rank}",
+            device=gpu_id,
+            emit_canonical=canonical,
+            on_observation=self._on_observation,
+            on_anchor=self._on_anchor,
+            reanchor_when=self._can_reanchor,
+            reanchor_seconds=envs.SGLANG_STEP_TRACE_REANCHOR_INTERVAL_S.get(),
         )
-        self._file = open(self.path, "ab")
+        if canonical and parallel.tp_rank == 0:
+            self.lifecycle = LifecycleTracer("sglang", "scheduler")
+        if envs.SGLANG_ENABLE_STEP_TRACE.get():
+            directory = Path(envs.SGLANG_STEP_TRACE_DIR.get())
+            if (
+                canonical
+                and directory.resolve()
+                == Path(os.environ["REQUEST_ENERGY_TRACE_DIR"]).resolve()
+            ):
+                raise RuntimeError("Native and canonical trace directories must differ")
+            rank = (
+                f"dp{parallel.dp_rank or 0}_tp{parallel.tp_rank}_pp{parallel.pp_rank}"
+            )
+            name = f"step_trace.{rank}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+            self.path = directory / (name + ".jsonl")
+            self.health_path = directory / (name + ".health.json")
+            self.native = TraceWriter(
+                self.path,
+                {
+                    "format_id": NATIVE_FORMAT,
+                    "producer_id": name,
+                    "role": "engine_native",
+                    "clock": clock.CLOCK,
+                    "boot_id": clock.boot_id(),
+                    "pid": os.getpid(),
+                    "rank_tag": rank,
+                    "gpu_id": gpu_id,
+                    "device_name": self.device.device_name,
+                    "device_uuid": self.device.device_id,
+                    "enable_overlap": enable_overlap,
+                    "time_source": "cuda_event",
+                },
+                flush_records=envs.SGLANG_STEP_TRACE_FLUSH_STEPS.get(),
+            )
+            self._on_anchor(
+                {
+                    "kind": "anchor",
+                    "anchor_id": self.device.anchor_id,
+                    "host_ns": self.device.anchor_host_ns,
+                    "uncertainty_ns": self.device.anchor_uncertainty_ns,
+                }
+            )
         atexit.register(self.close)
 
-        self._buffer.append(
-            self._build_meta(rank_tag=rank_tag, gpu_id=gpu_id, device=device)
+    def _can_reanchor(self):
+        with self._lock:
+            return self._idle and not self.prepared
+
+    def _native_emit(self, record):
+        if self.native and not self.native.emit(record):
+            raise RuntimeError("Native trace queue overflow; attribution is invalid")
+
+    def _on_anchor(self, record):
+        with self._lock:
+            self._native_emit(record)
+
+    def arrive(self, req, is_retracted=False):
+        if self.lifecycle:
+            if req.rid not in self.known:
+                self.lifecycle.request(req.rid, "arrive", client_id=req.rid)
+                self.known.add(req.rid)
+            if is_retracted:
+                self.lifecycle.request(req.rid, "release")
+
+    def abort(self, req):
+        if self.lifecycle and req.rid in self.known:
+            self.lifecycle.request(req.rid, "cancel", outcome="aborted")
+        self.known.discard(req.rid)
+        self.recompute_ranges.pop(req.rid, None)
+
+    def prepare(self, batch):
+        if self.device.health()["error"]:
+            raise RuntimeError("GPU trace resolver failed")
+        if self.lifecycle:
+            self.lifecycle.hold(str(batch.forward_iter))
+        owners, supported = _snapshot_native_owners(batch)
+        updated = []
+        for owner in owners:
+            rid = owner.rid
+            if self.lifecycle:
+                self.lifecycle.admit(rid, client_id=rid)
+                self.known.add(rid)
+            before, end = owner.context_len - owner.selected_tokens, owner.context_len
+            ranges = self.recompute_ranges.get(rid, [])
+            repeated = sum(
+                max(0, min(end, right) - max(before, left)) for left, right in ranges
+            )
+            merged = []
+            for left, right in sorted([*ranges, (before, end)]):
+                if merged and left <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(right, merged[-1][1]))
+                else:
+                    merged.append((left, right))
+            self.recompute_ranges[rid] = merged
+            updated.append(replace(owner, recompute_tokens=repeated))
+        snapshot = StepSnapshot(
+            batch.forward_iter,
+            batch.forward_mode.name,
+            len(batch.reqs),
+            tuple(updated),
+            supported and self.supported_profile,
+            self.clock.now_ns(),
         )
-        self._take_anchor()
-        self._flush()
-        logger.info(f"Step trace enabled, writing to {self.path}")
+        with self._lock:
+            if len(self.prepared) >= 8192 or batch.forward_iter in self.prepared:
+                raise RuntimeError("Invalid or excessive outstanding scheduler steps")
+            self._idle = False
+            self.prepared[batch.forward_iter] = {
+                "snapshot": snapshot,
+                "requests": tuple(batch.reqs),
+                "expected": {"forward"},
+                "intervals": {},
+                "result_ns": None,
+                "launch_end_ns": None,
+            }
 
-    # ===== Hooks =====
+    def _begin(self, batch, work_kind):
+        from request_energy.instrumentation import sampling_owners
 
-    def on_launch_begin(self, batch: ScheduleBatch) -> None:
-        """
-        A hook that runs after the scheduler has chosen the batch, before anything is launched.
-            + Snapshots who is in the batch and how much work each request brings (`_snapshot_owners`). It reads only CPU-side data, so it never waits for the GPU.
-            + Records the host time and a start event on the GPU stream. A CUDA event is a marker in the GPU's work queue that the GPU timestamps when it reaches it.
-            + Keeps both in a temporary open-step object.
-        """
-        owners, owners_traced = _snapshot_owners(batch)
-        self._open = _OpenStep(
-            forward_mode=batch.forward_mode.name,
-            batch_size=len(batch.reqs),
-            owners=owners,
-            owners_traced=owners_traced,
-            host_launch_begin_ns=trace_clock_ns(),
-            start_event=self._record_start_event(),
-        )
-
-    def on_launch_end(self, batch: ScheduleBatch) -> None:
-        """
-        A hook that is called after ``run_batch`` returns.
-            + Records the end event. It sits behind all of the step's work (forward pass, sampling, copy of results to the CPU), so it fires when that work is done.
-            + Files the open step under `batch.forward_iter`, the scheduler's step counter, which becomes `step_id`. The counter is only assigned inside run_batch, which is why the owner rows get their `step_id` later.
-        """
-        step = self._open
-        self._open = None
-        if step is None or batch.forward_iter is None:
-            return
-        step.end_event = self._record_event()
-        step.host_launch_end_ns = trace_clock_ns()
-        self._pending[batch.forward_iter] = step
-
-    def on_delayed_sample(self, batch: Optional[ScheduleBatch]) -> None:
-        """Move the step's end event behind sampling launched after run_batch.
-
-        The overlap loop may defer sampling (grammar-constrained batches,
-        SGLANG_ENABLE_DELAY_SAMPLE) until the previous result is processed. If
-        nothing was deferred, the new end event fires right after the old one.
-        """
-        if batch is None:
-            return
-        step = self._pending.get(batch.forward_iter)
-        if step is not None:
-            step.end_event = self._record_event()
-
-    def on_result(self, batch: ScheduleBatch) -> None:
-        """
-        A hook that runs at the end of `process_batch_result`, when the GPU work has finished.
-            + Looks up the open step by `forward_iter`, converts both events to host time (Clocks section), computes batch totals from the owner rows, and buffers one step record plus its owner records.
-            + Without overlap, re-anchors the clock if the last anchor is older than the interval. That is cheap here because the GPU is already idle.
-            + Writes the buffer to disk every `FLUSH_STEPS` steps.
-        """
-        step = self._pending.pop(batch.forward_iter, None)
-        if step is None:
-            return
-        self._emit_step(step_id=batch.forward_iter, step=step)
-        if not self._enable_overlap:
-            # The forward has drained, so a fresh anchor costs no overlap.
-            self._maybe_reanchor()
-        self._steps_since_flush += 1
-        if self._steps_since_flush >= self._flush_steps:
-            self._flush()
-
-    def on_idle(self) -> None:
-        """
-        A hook that runs when the scheduler has no batch. Re-anchors if due and flushes the buffer.
-        """
-        if self._pending:
-            return
-        self._maybe_reanchor()
-        if self._buffer:
-            self._flush()
-
-    def close(self) -> None:
-        if self._file.closed:
-            return
-        self._flush()
-        self._file.close()
-
-    # ===== Record building =====
-
-    def _build_meta(self, *, rank_tag: str, gpu_id: int, device: str) -> MetaRecord:
-        device_name, device_uuid = device, None
-        if self._use_device_events:
-            props = torch.cuda.get_device_properties(torch.cuda.current_device())
-            device_name = props.name
-            device_uuid = f"GPU-{props.uuid}"
-        return MetaRecord(
-            schema_version=TRACE_SCHEMA_VERSION,
-            clock=TRACE_CLOCK,
-            pid=os.getpid(),
-            rank_tag=rank_tag,
-            gpu_id=gpu_id,
-            device_name=device_name,
-            device_uuid=device_uuid,
-            enable_overlap=self._enable_overlap,
-            time_source="cuda_event" if self._use_device_events else "host",
+        with self._lock:
+            entry = self.prepared[batch.forward_iter]
+            entry["expected"].add(work_kind)
+            snapshot = entry["snapshot"]
+            owners = [o.canonical() for o in snapshot.owners]
+        if work_kind == "sampling":
+            owners = sampling_owners(owners)
+        # Do not hold the snapshot lock while entering the timer: its resolver
+        # invokes our callback under the timer lock (the opposite lock order).
+        self.device.begin(
+            f"{snapshot.step_id}:{work_kind}",
+            owners,
+            stream=self.stream,
+            supported=snapshot.owners_traced,
+            work_kind=work_kind,
+            logical_step_id=str(snapshot.step_id),
         )
 
-    def _emit_step(self, *, step_id: int, step: _OpenStep) -> None:
-        if self._use_device_events:
-            # No-op once the result has been copied out; guards the overlap path.
-            # This should never block for long because the GPU should be ready here
-            step.end_event.synchronize()
-            t_start_ns = self._event_to_host_ns(step.start_event)
-            t_end_ns = self._event_to_host_ns(step.end_event)
-        else:
-            t_start_ns = step.host_launch_begin_ns
-            t_end_ns = step.host_launch_end_ns
+    def on_launch_begin(self, batch):
+        self._begin(batch, "forward")
 
-        owners = [msgspec.structs.replace(o, step_id=step_id) for o in step.owners]
+    def on_launch_end(self, batch):
+        self.device.end(f"{batch.forward_iter}:forward", stream=self.stream)
+        with self._lock:
+            self.prepared[batch.forward_iter]["launch_end_ns"] = self.clock.now_ns()
+
+    def on_sample_begin(self, batch):
+        self._begin(batch, "sampling")
+
+    def on_sample_end(self, batch):
+        self.device.end(f"{batch.forward_iter}:sampling", stream=self.stream)
+
+    def on_delayed_sample(self, batch):
+        # Actual deferred work has a sampling pair; no duplicate end event.
+        pass
+
+    def _on_observation(self, observation):
+        record = observation.record()
+        step_id = int(record["logical_step_id"])
+        with self._lock:
+            self.prepared[step_id]["intervals"][record["work_kind"]] = record
+            self._finish_native(step_id)
+
+    def _finish_native(self, step_id):
+        # Snapshot lock held; never calls into the CUDA timer.
+        entry = self.prepared[step_id]
+        if entry["result_ns"] is None or entry["expected"] != entry["intervals"].keys():
+            return
+        s = entry["snapshot"]
+        intervals = list(entry["intervals"].values())
+        forward = entry["intervals"]["forward"]
+        owners = s.owners if s.owners_traced else ()
         prefill = [o for o in owners if o.phase == "prefill"]
         decode = [o for o in owners if o.phase == "decode"]
-        self._buffer.append(
-            StepRecord(
-                step_id=step_id,
-                forward_mode=step.forward_mode,
-                batch_size=step.batch_size,
-                t_start_ns=t_start_ns,
-                t_end_ns=t_end_ns,
-                host_launch_begin_ns=step.host_launch_begin_ns,
-                host_launch_end_ns=step.host_launch_end_ns,
-                host_result_ns=trace_clock_ns(),
-                anchor_id=self._anchor_id,
-                num_prefill_reqs=len(prefill),
-                num_decode_reqs=len(decode),
-                prefill_tokens=sum(o.selected_tokens for o in prefill),
-                decode_tokens=sum(o.selected_tokens for o in decode),
-                cached_tokens=sum(o.cached_tokens for o in prefill),
-                kv_read_tokens=sum(o.context_len - o.selected_tokens for o in owners),
-                overlap_enabled=self._enable_overlap,
-                owners_traced=step.owners_traced,
-            )
+        self._native_emit(
+            {
+                "kind": "step",
+                "step_id": step_id,
+                "logical_step_id": str(step_id),
+                "forward_mode": s.forward_mode,
+                "batch_size": s.batch_size,
+                "t_start_ns": min(r["start_ns"] for r in intervals),
+                "t_end_ns": max(r["end_ns"] for r in intervals),
+                "host_launch_begin_ns": s.host_launch_begin_ns,
+                "host_launch_end_ns": entry["launch_end_ns"],
+                "host_result_ns": entry["result_ns"],
+                "anchor_id": forward["anchor_id"],
+                "uncertainty_ns": max(r["uncertainty_ns"] for r in intervals),
+                "num_prefill_reqs": len(prefill),
+                "num_decode_reqs": len(decode),
+                "prefill_tokens": sum(o.selected_tokens for o in prefill),
+                "decode_tokens": sum(o.selected_tokens for o in decode),
+                "cached_tokens": sum(o.cached_tokens for o in prefill),
+                "kv_read_tokens": sum(
+                    o.context_len - o.selected_tokens for o in owners
+                ),
+                "overlap_enabled": self.enable_overlap,
+                "owners_traced": s.owners_traced,
+                "execution_intervals": [
+                    {
+                        k: r[k]
+                        for k in (
+                            "execution_id",
+                            "work_kind",
+                            "start_ns",
+                            "end_ns",
+                            "anchor_id",
+                        )
+                    }
+                    for r in intervals
+                ],
+            }
         )
-        self._buffer.extend(owners)
+        for owner in owners:
+            self._native_emit(owner.native(step_id))
+        del self.prepared[step_id]
 
-    # ===== Clock anchoring =====
+    def on_result(self, batch):
+        with self._lock:
+            entry = self.prepared[batch.forward_iter]
+            requests = entry["requests"]
+            entry["result_ns"] = self.clock.now_ns()
+            self._finish_native(batch.forward_iter)
+        if self.lifecycle:
+            self.lifecycle.release_hold(str(batch.forward_iter))
+        for req in requests:
+            if req.finished():
+                if self.lifecycle and req.rid in self.known:
+                    self.lifecycle.request(
+                        req.rid, "finish", outcome=type(req.finished_reason).__name__
+                    )
+                    self.known.remove(req.rid)
+                self.recompute_ranges.pop(req.rid, None)
 
-    def _record_start_event(self) -> Optional[torch.cuda.Event]:
-        if self._use_device_events and self._enable_overlap:
-            # Same wait run_batch issues; without it the event fires when the
-            # previous forward drains, before this step's inputs are ready.
-            self._forward_stream.wait_stream(torch.cuda.current_stream())
-        return self._record_event()
+    def on_idle(self):
+        with self._lock:
+            self._idle = True
+        self.device.completed()
+        if self.device.health()["error"]:
+            raise RuntimeError("GPU/native trace resolver failed")
 
-    def _record_event(self) -> Optional[torch.cuda.Event]:
-        if not self._use_device_events:
-            return None
-        event = torch.cuda.Event(enable_timing=True)
-        # Non-overlap forwards run on the scheduler's current stream.
-        event.record(self._forward_stream if self._enable_overlap else None)
-        return event
-
-    def _event_to_host_ns(self, event: torch.cuda.Event) -> int:
-        # elapsed_time is in ms with ~0.5 us resolution.
-        return self._anchor_host_ns + round(
-            self._anchor_event.elapsed_time(event) * 1e6
-        )
-
-    def _maybe_reanchor(self) -> None:
-        if trace_clock_ns() - self._anchor_host_ns >= self._reanchor_interval_ns:
-            self._take_anchor()
-
-    def _take_anchor(self) -> None:
-        if not self._use_device_events:
-            self._anchor_id += 1
-            self._anchor_host_ns = trace_clock_ns()
-            self._buffer.append(
-                AnchorRecord(
-                    anchor_id=self._anchor_id,
-                    host_ns=self._anchor_host_ns,
-                    uncertainty_ns=0,
-                )
-            )
+    def close(self):
+        if self._closed:
             return
-        # Drain first so the event completes as soon as it is enqueued.
-        torch.cuda.synchronize()
-        event = torch.cuda.Event(enable_timing=True)
-        before_ns = trace_clock_ns()
-        event.record()
-        event.synchronize()
-        after_ns = trace_clock_ns()
-        self._anchor_id += 1
-        self._anchor_event = event
-        self._anchor_host_ns = (before_ns + after_ns) // 2
-        self._buffer.append(
-            AnchorRecord(
-                anchor_id=self._anchor_id,
-                host_ns=self._anchor_host_ns,
-                uncertainty_ns=(after_ns - before_ns + 1) // 2,
-            )
-        )
-
-    # ===== Output =====
-
-    def _flush(self) -> None:
-        if not self._buffer:
-            return
-        self._file.write(self._encoder.encode_lines(self._buffer))
-        self._file.flush()
-        self._buffer = []
-        self._steps_since_flush = 0
+        self._closed = True
+        try:
+            self.device.close()
+        finally:
+            if self.lifecycle:
+                self.lifecycle.close()
+            if self.native:
+                try:
+                    self.native.close()
+                finally:
+                    health = self.native.health()
+                    health.update(
+                        format_id=NATIVE_FORMAT,
+                        outstanding_steps=len(self.prepared),
+                        resolver=self.device.health(),
+                        complete=not self.prepared
+                        and not self.device.health()["error"]
+                        and not health["error"]
+                        and not health["dropped_records"],
+                    )
+                    self.health_path.write_text(json.dumps(health) + "\n")
 
 
-def _snapshot_owners(batch: ScheduleBatch) -> tuple[List[OwnerRecord], bool]:
-    """
-        This method answers, per step: which requests are in this forward pass, and how much work does each bring?
-        It returns the owner rows plus a flag `owners_traced` saying whether they can be trusted.
-
-        The owner records tell you who was in the step and in what proportion, which is what's needed to split that energy across requests.
-
-        How it decides. It looks at the batch type and reads the right fields for it:
-            + `DECODE` => every request generates one token. selected_tokens = 1, context_len = sequence length incl. this step's input token.
-            + `EXTEND` => prefill. selected_tokens = tokens computed now, cached_tokens = KV reused, context_len = their sum
-            + `MIXED` =>  prefill with decoding requests riding along. As `EXTEND`; requests in `batch.decoding_reqs` are labelled decode with `cached_tokens = 0`
-            + anything else (Speculative decoding, IDLE, PREBUILT, SPLIT_PREFILL, DLLM_EXTEND) => No owner rows, `owners_traced: false`
-
-        This method reads only CPU-side data. It never waits on the GPU, so it doesn't slow down the step it's measuring.
-
-    Args:
-        batch (ScheduleBatch): the batch of this forward pass
-
-    Returns:
-        tuple[List[OwnerRecord], bool]: A list of owner records (one per request), and a flag whether this list can be trusted.
-    """
-    mode = batch.forward_mode
-    # Speculative decoding is on! In that case the owners are unknown.
-    if not batch.spec_algorithm.is_none():
-        return [], False
-    # The whole batch is a pure decode step: every request in it generates exactly one token
-    if mode.is_decode():
-        return _snapshot_decode_owners(batch), True
-    # Decoding paired with prefill (MIXED) or prefill (EXTEND => Compute KV cache)
-    if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
-        return _snapshot_extend_owners(batch), True
-    return [], False
-
-
-def _snapshot_decode_owners(batch: ScheduleBatch) -> List[OwnerRecord]:
-    num_reqs = len(batch.reqs)
-    # prepare_for_decode already counted this step's input token (we do not have to add +1!); 
-    # rows past num_reqs are a beam tail (best n output candidates), not requests.
-    if batch.seq_lens_cpu is not None:
-        # read the current sequence length of each request (drop beam-search tail rows before)
-        seq_lens = batch.seq_lens_cpu[:num_reqs].tolist()
-    else:
-        # Fallback, if the info is not available on the CPU (e.g. speculative decoding)
-        # This should never be called if we filter these unknowns
-        # req.seqlen lags behind seq_lens_cpu in overlap mode
-        seq_lens = [req.seqlen for req in batch.reqs]
-    return [
-        _owner_record(
-            req=req,
-            phase="decode",
-            selected_tokens=1,
-            context_len=int(seq_len),
-            cached_tokens=0,
-            is_chunked=False,
-        )
-        for req, seq_len in zip(batch.reqs, seq_lens, strict=True)
-    ]
-
-
-def _snapshot_extend_owners(batch: ScheduleBatch) -> List[OwnerRecord]:
-    """
-        Note: when SGLang builds a prefill batch, it already computes two lists aligned with batch.reqs:
-            + `batch.prefix_lens[i]`: how many tokens of request i already have KV in the cache (from radix-cache hits or earlier chunks).
-            + `batch.extend_lens[i]`: how many new tokens request i computes in this step.
-
-        For a `MIXED` batch, `mix_with_running()` appends the decoding requests to the end of both lists, 
-        with `prefix_len = seq_len - 1` and `extend_len = 1`. That's exactly what a decode step does, written in prefill terms. It also stores those requests in batch.decoding_reqs.
-    """
-    # Mixed batches (and decode batches converted to extend) carry their
-    # decode requests in decoding_reqs, appended after the prefill rows.
-    decode_ids = {id(req) for req in batch.decoding_reqs or []}
-    owners = []
-    for req, prefix_len, extend_len in zip(
-        batch.reqs, batch.prefix_lens, batch.extend_lens, strict=True
+def _snapshot_native_owners(batch):
+    """PR #1 ownership semantics; no GPU read or mutable request references."""
+    if not batch.spec_algorithm.is_none() or getattr(batch, "beam_tail", None):
+        return (), False
+    if any(
+        getattr(r, "beam_group", None) is not None or r.multimodal_inputs is not None
+        for r in batch.reqs
     ):
-        is_decode = id(req) in decode_ids
-        owners.append(
-            _owner_record(
-                req=req,
-                phase="decode" if is_decode else "prefill",
-                selected_tokens=extend_len,
-                context_len=prefix_len + extend_len,
-                cached_tokens=0 if is_decode else prefix_len,
-                # batch.chunked_req is the request whose prefill continues next step.
-                is_chunked=not is_decode and req is batch.chunked_req,
+        return (), False
+    if batch.forward_mode.is_decode():
+        if batch.seq_lens_cpu is None:
+            return (), False
+        rows = [
+            (r, "decode", 1, int(n), 0, False)
+            for r, n in zip(
+                batch.reqs, batch.seq_lens_cpu[: len(batch.reqs)].tolist(), strict=True
             )
+        ]
+    elif batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+        decode_ids = {id(r) for r in batch.decoding_reqs or []}
+        rows = [
+            (
+                r,
+                "decode" if id(r) in decode_ids else "prefill",
+                int(n),
+                int(p + n),
+                0 if id(r) in decode_ids else int(p),
+                id(r) not in decode_ids and r is batch.chunked_req,
+            )
+            for r, p, n in zip(
+                batch.reqs, batch.prefix_lens, batch.extend_lens, strict=True
+            )
+        ]
+    else:
+        return (), False
+    return tuple(
+        OwnerSnapshot(
+            r.rid,
+            phase,
+            n,
+            context,
+            cached,
+            int(r.cached_tokens),
+            chunked,
+            int(r.retraction_count),
         )
-    return owners
+        for r, phase, n, context, cached, chunked in rows
+    ), True
 
 
-def _owner_record(
-    *,
-    req,
-    phase: str,
-    selected_tokens: int,
-    context_len: int,
-    cached_tokens: int,
-    is_chunked: bool,
-) -> OwnerRecord:
-    return OwnerRecord(
-        # Filled in on_result, once run_batch has assigned forward_iter.
-        step_id=-1,
-        rid=req.rid,
-        phase=phase,
-        selected_tokens=selected_tokens,
-        context_len=context_len,
-        cached_tokens=cached_tokens,
-        req_cached_tokens=req.cached_tokens,
-        is_chunked=is_chunked,
-        retraction_count=req.retraction_count,
-    )
+def _snapshot_owners(batch):
+    owners, supported = _snapshot_native_owners(batch)
+    return [o.canonical() for o in owners], supported
 
 
 def create_step_tracer(
-    *,
-    gpu_id: int,
-    device: str,
-    enable_overlap: bool,
-    forward_stream: Optional[torch.cuda.Stream],
-) -> Union[SchedulerStepTracer, NoopStepTracer]:
-    if not envs.SGLANG_ENABLE_STEP_TRACE.get():
+    *, gpu_id, device, enable_overlap, forward_stream, supported_profile=True
+):
+    if not (
+        envs.SGLANG_ENABLE_STEP_TRACE.get()
+        or os.environ.get("REQUEST_ENERGY_TRACE_DIR")
+    ):
         return NoopStepTracer()
     parallel = get_parallel()
+    if (
+        device != "cuda"
+        or not supported_profile
+        or parallel.pp_size != 1
+        or getattr(parallel, "dp_size", 1) > 1
+    ):
+        raise RuntimeError(
+            "Tracing requires supported single-host CUDA text generation"
+        )
     return SchedulerStepTracer(
-        output_dir=envs.SGLANG_STEP_TRACE_DIR.get(),
-        rank_tag=f"dp{parallel.dp_rank or 0}_tp{parallel.tp_rank}_pp{parallel.pp_rank}",
         gpu_id=gpu_id,
-        device=device,
         enable_overlap=enable_overlap,
         forward_stream=forward_stream,
-        flush_steps=envs.SGLANG_STEP_TRACE_FLUSH_STEPS.get(),
-        reanchor_interval_s=envs.SGLANG_STEP_TRACE_REANCHOR_INTERVAL_S.get(),
+        supported_profile=True,
     )
