@@ -117,6 +117,17 @@ class MlxModelRunnerStub(ModelRunner):
         """
         return 0
 
+    @property
+    def logical_max_total_num_tokens(self) -> int:
+        """Request-token capacity; MLX has no DCP, so one row holds one token.
+
+        The base property reads ``kv_cache_configurator``, which is built by the
+        ``alloc_memory_pool`` this stub replaces with a no-op.
+        """
+        return self.req_to_token_pool.schedulable_token_capacity(
+            self.max_total_num_tokens
+        )
+
     @staticmethod
     def validate_startup_weight_load_mode() -> None:
         if get_model().is_startup_weight_load_overlap:

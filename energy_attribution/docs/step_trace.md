@@ -14,6 +14,8 @@ approach (phases 1-4).
 | Configuration | Status |
 |---|---|
 | Prefill / decode / chunked prefill / mixed chunk, with or without `--disable-overlap-schedule` | Supported; validated on RTX 4090 |
+| Apple Silicon (MLX, `SGLANG_USE_MLX=1`), default overlap loop | Supported with host timing (see [MLX](#mlx-apple-silicon)); validated with Qwen3-0.6B on a 64 GB Mac |
+| MLX with `--disable-overlap-schedule` | Not usable: the scheduler crashes with an `mps`/`cpu` device mismatch in `FutureMap.stash`, independent of the tracer |
 | Retraction | Recorded (`retraction_count`), not yet exercised in tests |
 | Speculative decoding, DP attention, PP, PD disaggregation | Out of scope: steps are written with `owners_traced: false` and no owner rows |
 
@@ -55,6 +57,45 @@ two host clock reads. Half the bracket width is the anchor's uncertainty,
 typically 50-110 µs. Anchors are re-taken only when the GPU is idle, so they add
 no stall to running steps.
 
+## MLX (Apple Silicon)
+
+MLX runs its own overlap loop (`event_loop_overlap_mlx` in
+`python/sglang/srt/hardware_backend/mlx/scheduler_mixin.py`). It queues work with
+`mx.async_eval` and, during a decode run, builds step N+1 on step N's still-lazy
+tokens ("chained decode") before waiting for step N.
+
+MLX exposes no device timestamps, so the trace uses host time
+(`time_source: "host_result_sync"`, anchors with zero uncertainty):
+
+- `t_end_ns` is when the step's tokens reached the host. It is an upper bound on
+  when the device finished: late by however long the scheduler took to come back
+  and wait for them.
+- `t_start_ns` is the later of the step's launch end and the previous step's
+  `t_end_ns`, because the device runs steps in launch order.
+- The windows therefore tile the busy time without overlapping, but the boundary
+  between two chained steps is only as precise as the host's wait.
+
+Other MLX differences:
+
+- **Ride-along steps.** A finished request rides along for one extra decode step
+  only if it finished in the middle of a decode chain, so `check` accepts either
+  count on MLX.
+- **`context_len`.** Chained decodes do not advance the scheduler's `seq_lens`, so
+  MLX decode owners are taken from the request's prompt + output length instead.
+- **Memory.** Without `--max-total-tokens`, MLX sizes its KV pool from currently
+  free memory: about 30 GB on one run and 48 GB on another, which then failed with
+  a Metal out-of-memory error. Set it explicitly so runs are comparable, e.g.
+  `--max-total-tokens 65536` for 8 requests x 8192 tokens (about 7.5 GB for
+  Qwen3-0.6B).
+
+```bash
+SGLANG_ENABLE_STEP_TRACE=1 SGLANG_STEP_TRACE_DIR=energy_attribution/runs/$RUN \
+SGLANG_USE_MLX=1 SGLANG_RUST_BUILD_MODE=never python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-0.6B --host 127.0.0.1 --port 30123 \
+    --disable-cuda-graph --context-length 8192 --max-running-requests 8 \
+    --max-total-tokens 65536
+```
+
 ## Trace format
 
 JSON Lines. Every line has a `kind` field: `meta`, `anchor`, `step` or `owner`.
@@ -78,7 +119,7 @@ per_step = owners.merge(steps, on="step_id", suffixes=("", "_step"))
 | `gpu_id`, `device_name` | GPU this scheduler drives. |
 | `device_uuid` | Same `GPU-...` format NVML reports (`nvmlDeviceGetUUID`), so a power sampler can pick the right device. |
 | `enable_overlap` | Whether the overlap scheduler was on. |
-| `time_source` | `cuda_event` = step times come from GPU events; `host` = no GPU available, host timestamps used instead. |
+| `time_source` | `cuda_event` = step times come from GPU events; `host_result_sync` = MLX, host timestamps bounded by when results reached the host (see [MLX](#mlx-apple-silicon)); `host` = no GPU available, the host launch window is used instead. |
 
 ### `anchor` (at startup, then at most every `REANCHOR_INTERVAL_S` while idle)
 

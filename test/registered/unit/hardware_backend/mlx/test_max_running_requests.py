@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
@@ -143,6 +144,19 @@ class TestMlxMaxRunningRequests(CustomTestCase):
     def test_flag_clamped_to_capacity(self):
         # A flag larger than the KV pool can hold is capped at pool // 2.
         self.assertEqual(_resolve(_stub(100_000, 1000)), 500)
+
+
+@unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
+class TestMlxLogicalTokenCapacity(CustomTestCase):
+    def test_capacity_readable_without_alloc_memory_pool(self):
+        """The stub's no-op alloc_memory_pool must leave startup validation working;
+        reading the logical capacity used to kill the scheduler on every MLX launch."""
+        stub = _stub(None, 1000)
+        stub.is_hybrid_swa = False
+        stub.req_to_token_pool = ReqToTokenPool(
+            size=1, max_context_len=8, device="cpu", enable_memory_saver=False
+        )
+        self.assertEqual(stub.effective_logical_max_total_num_tokens, 1000)
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
