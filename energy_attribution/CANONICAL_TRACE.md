@@ -63,6 +63,6 @@ Speculation, beams, multimodal/SSM, offloading, disaggregation, DP and PP are
 outside the trusted initial profile. The processor owns NVML/RAPL acquisition,
 energy policies, conservation and live/replay; engines never calculate joules.
 
-Native serving verification and its limits are recorded in the branch's
-validation receipt after execution; conservation alone does not prove physical
+Native serving verification and its limits are recorded in [VALIDATION.md](VALIDATION.md)
+and its machine-readable receipt; conservation alone does not prove physical
 per-request energy accuracy or low overhead.
