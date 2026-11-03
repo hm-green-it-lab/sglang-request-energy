@@ -171,7 +171,9 @@ def cmd_check(args: argparse.Namespace) -> None:
     - decode rows = completion_tokens - 1 (the prefill step samples the first
       token, each decode step one more), plus 1 under overlap: a finished request
       rides along for one discarded step, since step N+1 is launched before step
-      N's result shows the request finished;
+      N's result shows the request finished (on MLX either count, since it only
+      launches ahead while chaining decodes);
+    - decode rows attend prompt_tokens + 1, + 2, ... in order (context_len);
     - the last prefill chunk is not marked is_chunked.
     Retracted requests are skipped, since their prefill was partly recomputed.
 
@@ -201,6 +203,9 @@ def cmd_check(args: argparse.Namespace) -> None:
     for o in owners:
         owners_by_step[o["step_id"]].append(o)
     overlap = any(s["overlap_enabled"] for s in steps)
+    mlx_overlap = overlap and any(
+        m["time_source"] == "host_result_sync" for m in trace["meta"]
+    )
     # Forwards run one after another on one stream, with or without overlap.
     for prev, cur in zip(steps, steps[1:]):
         if cur["t_start_ns"] < prev["t_end_ns"]:
@@ -255,12 +260,25 @@ def cmd_check(args: argparse.Namespace) -> None:
         # The prefill step samples the first token; each decode step one more.
         # Under overlap a finished request rides along for one discarded step,
         # because step N+1 is launched before step N's result shows it finished.
+        # MLX overlap only launches ahead while chaining decodes, so the extra
+        # step appears only when the request finishes mid-chain.
         expected_decode = req["completion_tokens"] - 1 + (1 if overlap else 0)
-        if len(decode) != expected_decode:
+        allowed_decode = {expected_decode}
+        if mlx_overlap:
+            allowed_decode.add(expected_decode - 1)
+        if len(decode) not in allowed_decode:
             fail(
                 f"{rid}: {len(decode)} decode steps != expected {expected_decode} "
                 f"(completion_tokens {req['completion_tokens']}, overlap={overlap})"
             )
+        # Each decode step attends one token further than the one before.
+        for i, r in enumerate(decode):
+            if r["context_len"] != req["prompt_tokens"] + 1 + i:
+                fail(
+                    f"{rid}: decode step {r['step_id']} context_len {r['context_len']} "
+                    f"!= expected {req['prompt_tokens'] + 1 + i}"
+                )
+                break
         if any(r["is_chunked"] for r in prefill[-1:]):
             fail(f"{rid}: last prefill chunk marked is_chunked")
 

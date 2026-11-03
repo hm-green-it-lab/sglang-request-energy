@@ -104,6 +104,7 @@ class SchedulerMlxOverlapMixin:
 
     def _finalize_mlx_pending_job(self: Scheduler, pending: MlxPendingJob):
         result = self.tp_worker.finalize_mlx_result(pending.launch, pending.reqs)
+        self.step_tracer.on_result_ready(pending.batch_copy)
         result.extend_input_len_per_req = pending.extend_input_len_per_req
         result.extend_logprob_start_len_per_req = (
             pending.extend_logprob_start_len_per_req
@@ -158,6 +159,7 @@ class SchedulerMlxOverlapMixin:
         pending_next: Optional[MlxPendingJob] = None
 
         def _launch_fresh(batch: ScheduleBatch) -> MlxPendingJob:
+            self.step_tracer.on_launch_begin(batch)
             self._prepare_mlx_launch(batch)
             # Materialize batch.input_ids from CPU staging (prefill) or the
             # FutureMap relay (decode) before the forward. With deferred input
@@ -167,6 +169,7 @@ class SchedulerMlxOverlapMixin:
             # dereferences a None input_ids.
             resolve_forward_inputs(batch, self.future_map)
             launch = self.tp_worker.async_forward_batch_generation_mlx(batch)
+            self.step_tracer.on_launch_end(batch)
             extend_input_len_per_req = None
             extend_logprob_start_len_per_req = None
             if batch.return_logprob:
@@ -193,16 +196,15 @@ class SchedulerMlxOverlapMixin:
             # underlying ScheduleBatch is needed so process_batch_result
             # updates the same req objects with the new token.
             batch_copy = prev.batch_copy.copy()
+            self.step_tracer.on_chained_launch_begin(prev.batch_copy)
             self._prepare_mlx_launch(batch_copy)
             # Keep the live scheduler batch's iteration aligned: when the
             # chain breaks, prepare_for_decode() may run SWA maintenance
             # before the next fresh launch gets a chance to re-stamp it.
             prev.schedule_batch.forward_iter = batch_copy.forward_iter
-            return replace(
-                prev,
-                launch=self.tp_worker.async_chained_decode_mlx(prev.launch.decode),
-                batch_copy=batch_copy,
-            )
+            launch = self.tp_worker.async_chained_decode_mlx(prev.launch.decode)
+            self.step_tracer.on_launch_end(batch_copy)
+            return replace(prev, launch=launch, batch_copy=batch_copy)
 
         while True:
             if self.gracefully_exit:
@@ -276,6 +278,7 @@ class SchedulerMlxOverlapMixin:
                 self.result_queue.append(pending_curr)
             else:
                 self._sched_idled = True
+                self.step_tracer.on_idle()
                 self.on_idle()
 
             self.last_batch = next_batch

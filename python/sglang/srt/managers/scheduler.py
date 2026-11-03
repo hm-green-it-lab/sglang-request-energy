@@ -2527,8 +2527,9 @@ class Scheduler(
         self.step_tracer = create_step_tracer(
             gpu_id=get_device().gpu_id,
             device=self.device,
-            enable_overlap=self.enable_overlap,
+            enable_overlap=self.enable_overlap or self.enable_overlap_mlx,
             forward_stream=self.forward_stream,
+            host_result_sync=self.enable_overlap_mlx,
         )
 
     def init_req_max_new_tokens(self, req):

@@ -141,6 +141,8 @@ class _OpenStep(msgspec.Struct):
     start_event: Optional[torch.cuda.Event]
     host_launch_end_ns: int = 0
     end_event: Optional[torch.cuda.Event] = None
+    # MLX only: when the step's tokens reached the host; 0 if not reported.
+    host_ready_ns: int = 0
 
 
 class NoopStepTracer:
@@ -150,6 +152,12 @@ class NoopStepTracer:
         pass
 
     def on_launch_end(self, batch: ScheduleBatch) -> None:
+        pass
+
+    def on_chained_launch_begin(self, prev_batch: ScheduleBatch) -> None:
+        pass
+
+    def on_result_ready(self, batch: ScheduleBatch) -> None:
         pass
 
     def on_delayed_sample(self, batch: Optional[ScheduleBatch]) -> None:
@@ -177,8 +185,10 @@ class SchedulerStepTracer:
         forward_stream: Optional[torch.cuda.Stream],
         flush_steps: int,
         reanchor_interval_s: float,
+        host_result_sync: bool = False,
     ):
         self._enable_overlap = enable_overlap
+        self._host_result_sync = host_result_sync
         self._forward_stream = forward_stream
         self._flush_steps = max(1, flush_steps)
         self._reanchor_interval_ns = int(reanchor_interval_s * 1e9)
@@ -190,6 +200,7 @@ class SchedulerStepTracer:
         self._open: Optional[_OpenStep] = None
         # Launched-but-unprocessed steps by forward_iter; >1 entry under overlap.
         self._pending: Dict[int, _OpenStep] = {}
+        self._last_t_end_ns = 0
 
         self._anchor_id = -1
         self._anchor_event: Optional[torch.cuda.Event] = None
@@ -218,7 +229,11 @@ class SchedulerStepTracer:
             + Records the host time and a start event on the GPU stream. A CUDA event is a marker in the GPU's work queue that the GPU timestamps when it reaches it.
             + Keeps both in a temporary open-step object.
         """
-        owners, owners_traced = _snapshot_owners(batch)
+        # MLX chained decodes never advance batch.seq_lens_cpu, but every earlier
+        # step is finalized before a fresh MLX launch, so req.seqlen is current.
+        owners, owners_traced = _snapshot_owners(
+            batch, use_req_seqlen=self._host_result_sync
+        )
         self._open = _OpenStep(
             forward_mode=batch.forward_mode.name,
             batch_size=len(batch.reqs),
@@ -241,6 +256,34 @@ class SchedulerStepTracer:
         step.end_event = self._record_event()
         step.host_launch_end_ns = trace_clock_ns()
         self._pending[batch.forward_iter] = step
+
+    def on_chained_launch_begin(self, prev_batch: ScheduleBatch) -> None:
+        """MLX chained decode: replaces ``on_launch_begin`` for a step built on a still-pending decode.
+
+        The chained step reuses the previous step's batch without ``prepare_for_decode``,
+        so its seq lengths are stale; the owners are the previous step's, one token further.
+        """
+        prev = self._pending.get(prev_batch.forward_iter)
+        if prev is None:
+            self._open = None
+            return
+        self._open = _OpenStep(
+            forward_mode=prev.forward_mode,
+            batch_size=prev.batch_size,
+            owners=[
+                msgspec.structs.replace(o, context_len=o.context_len + 1)
+                for o in prev.owners
+            ],
+            owners_traced=prev.owners_traced,
+            host_launch_begin_ns=trace_clock_ns(),
+            start_event=None,
+        )
+
+    def on_result_ready(self, batch: ScheduleBatch) -> None:
+        """MLX: the step's tokens have reached the host, so its device work is done."""
+        step = self._pending.get(batch.forward_iter)
+        if step is not None:
+            step.host_ready_ns = trace_clock_ns()
 
     def on_delayed_sample(self, batch: Optional[ScheduleBatch]) -> None:
         """Move the step's end event behind sampling launched after run_batch.
@@ -306,8 +349,15 @@ class SchedulerStepTracer:
             device_name=device_name,
             device_uuid=device_uuid,
             enable_overlap=self._enable_overlap,
-            time_source="cuda_event" if self._use_device_events else "host",
+            time_source=self._time_source(),
         )
+
+    def _time_source(self) -> str:
+        if self._use_device_events:
+            return "cuda_event"
+        if self._host_result_sync:
+            return "host_result_sync"
+        return "host"
 
     def _emit_step(self, *, step_id: int, step: _OpenStep) -> None:
         if self._use_device_events:
@@ -316,9 +366,16 @@ class SchedulerStepTracer:
             step.end_event.synchronize()
             t_start_ns = self._event_to_host_ns(step.start_event)
             t_end_ns = self._event_to_host_ns(step.end_event)
+        elif step.host_ready_ns:
+            # No device timestamps on MLX. The device runs steps in launch order, so a
+            # step starts once launched and its predecessor is done; the end is an
+            # upper bound, late by however long the host took to block on the tokens.
+            t_start_ns = max(step.host_launch_end_ns, self._last_t_end_ns)
+            t_end_ns = step.host_ready_ns
         else:
             t_start_ns = step.host_launch_begin_ns
             t_end_ns = step.host_launch_end_ns
+        self._last_t_end_ns = t_end_ns
 
         owners = [msgspec.structs.replace(o, step_id=step_id) for o in step.owners]
         prefill = [o for o in owners if o.phase == "prefill"]
@@ -414,7 +471,9 @@ class SchedulerStepTracer:
         self._steps_since_flush = 0
 
 
-def _snapshot_owners(batch: ScheduleBatch) -> tuple[List[OwnerRecord], bool]:
+def _snapshot_owners(
+    batch: ScheduleBatch, *, use_req_seqlen: bool = False
+) -> tuple[List[OwnerRecord], bool]:
     """
         This method answers, per step: which requests are in this forward pass, and how much work does each bring?
         It returns the owner rows plus a flag `owners_traced` saying whether they can be trusted.
@@ -441,18 +500,23 @@ def _snapshot_owners(batch: ScheduleBatch) -> tuple[List[OwnerRecord], bool]:
         return [], False
     # The whole batch is a pure decode step: every request in it generates exactly one token
     if mode.is_decode():
-        return _snapshot_decode_owners(batch), True
+        return _snapshot_decode_owners(batch, use_req_seqlen=use_req_seqlen), True
     # Decoding paired with prefill (MIXED) or prefill (EXTEND => Compute KV cache)
     if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
         return _snapshot_extend_owners(batch), True
     return [], False
 
 
-def _snapshot_decode_owners(batch: ScheduleBatch) -> List[OwnerRecord]:
+def _snapshot_decode_owners(
+    batch: ScheduleBatch, *, use_req_seqlen: bool = False
+) -> List[OwnerRecord]:
     num_reqs = len(batch.reqs)
-    # prepare_for_decode already counted this step's input token (we do not have to add +1!); 
+    # prepare_for_decode already counted this step's input token (we do not have to add +1!);
     # rows past num_reqs are a beam tail (best n output candidates), not requests.
-    if batch.seq_lens_cpu is not None:
+    if use_req_seqlen:
+        # The step's input token is the last output token, already in req.seqlen.
+        seq_lens = [req.seqlen for req in batch.reqs]
+    elif batch.seq_lens_cpu is not None:
         # read the current sequence length of each request (drop beam-search tail rows before)
         seq_lens = batch.seq_lens_cpu[:num_reqs].tolist()
     else:
@@ -533,6 +597,7 @@ def create_step_tracer(
     device: str,
     enable_overlap: bool,
     forward_stream: Optional[torch.cuda.Stream],
+    host_result_sync: bool = False,
 ) -> Union[SchedulerStepTracer, NoopStepTracer]:
     if not envs.SGLANG_ENABLE_STEP_TRACE.get():
         return NoopStepTracer()
@@ -546,4 +611,5 @@ def create_step_tracer(
         forward_stream=forward_stream,
         flush_steps=envs.SGLANG_STEP_TRACE_FLUSH_STEPS.get(),
         reanchor_interval_s=envs.SGLANG_STEP_TRACE_REANCHOR_INTERVAL_S.get(),
+        host_result_sync=host_result_sync,
     )
