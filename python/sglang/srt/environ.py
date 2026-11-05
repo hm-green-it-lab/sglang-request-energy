@@ -472,6 +472,14 @@ class Envs:
     SGLANG_TRACE_ASYNC = EnvBool(False)
     SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD = EnvInt(100)
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
+    # Per-step JSONL trace (step timing + per-request demand) for offline
+    # energy attribution; see scheduler_components/step_tracer.py.
+    SGLANG_ENABLE_STEP_TRACE = EnvBool(False)
+    SGLANG_STEP_TRACE_DIR = EnvStr("/tmp/sglang_step_trace")
+    # Buffered records are written out after this many traced steps (and on idle).
+    SGLANG_STEP_TRACE_FLUSH_STEPS = EnvInt(256)
+    # Re-pair the GPU event clock with time.monotonic_ns() at most this often.
+    SGLANG_STEP_TRACE_REANCHOR_INTERVAL_S = EnvFloat(10.0)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
     SGLANG_TRACE_LOGITS_E2E = EnvBool(False)
     SGLANG_TRACE_LOGITS_E2E_SYNC = EnvBool(False)

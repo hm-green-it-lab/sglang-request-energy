@@ -280,6 +280,14 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+.webui_secret_key
 
 # Internal, non-published docs
 internal-docs/
+
+# Energy attribution: run output and third-party papers stay local
+energy_attribution/runs/
+energy_attribution/papers/
+
+## energy_attribution
+energy_attribution/docs/doc.docx
